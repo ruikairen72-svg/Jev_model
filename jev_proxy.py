@@ -70,6 +70,14 @@ HOP_HEADERS = {"host", "content-length", "transfer-encoding", "connection",
 DROP_RESP_HEADERS = HOP_HEADERS | {"server", "date"}
 
 _state = {"key": None, "decision": None, "hits": 0, "misses": 0}
+# ---- token 计量：每步都重发的上下文才是真正的账单，这里把它记下来
+METER = (os.environ.get("JEVPROXY_METER", "1") or "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+USAGE_LOG = os.path.expanduser(os.environ.get("JEVPROXY_USAGE_LOG",
+                                              "~/.codex/jev-router/usage.jsonl"))
+METER_TAIL = int(os.environ.get("JEVPROXY_METER_TAIL", str(64 * 1024)))
+_usage = {"calls": 0, "input": 0, "cached": 0, "output": 0, "reasoning": 0}
+_USAGE_RE = re.compile(rb'"usage"\s*:\s*\{')
 _lock = threading.Lock()
 _cache = collections.OrderedDict()      # 轮指纹 -> 决策（同一轮/重复轮直接复用）
 CACHE_MAX = 64
@@ -163,7 +171,7 @@ def auto_mock(text):
     return "easy"
 
 
-def decide_for_turn(body):
+def decide_for_turn(body, headers=None):
     text, has_image, fp = newest_user_turn(body)
     if not fp:
         # 没有 user 消息的请求（历史压缩、内部续写等）：沿用最近一次决策，
@@ -204,6 +212,14 @@ def decide_for_turn(body):
         elif d["source"] == "fallback" and FALLBACK in R.TIERS:
             d = R._finish(FALLBACK, "Jev 不可用 → 回退 %s" % FALLBACK, "fallback",
                           {}, None, {}, {})
+
+    # 粘性必须在「写入缓存之前」应用：否则同一轮的工具循环会反复投票，
+    # 而且第一次请求和后续请求会拿到不同档位（一轮内换模型 = 缓存全废）。
+    if d and d.get("model"):
+        sid = _session_key(headers)
+        d, how = apply_sticky(sid, d)
+        if how and how not in ("同档", "init"):
+            plog("sticky[%s] %s -> %s（%s）" % (sid[:8], d.get("choice"), d.get("model"), how))
 
     with _lock:
         _cache[fp] = d
@@ -292,7 +308,7 @@ def inject_models(raw):
         return raw, False
 
 
-def rewrite(body_bytes):
+def rewrite(body_bytes, headers=None):
     """按需改写请求体。返回 (新字节, 决策)"""
     try:
         body = json.loads(body_bytes.decode("utf-8"))
@@ -311,7 +327,7 @@ def rewrite(body_bytes):
              % (req_model, ",".join(sorted(SENTINEL_SET))))
         return body_bytes, d
 
-    d = decide_for_turn(body)
+    d = decide_for_turn(body, headers)
     if is_auto and (not d or d["choice"] == "keep" or not d.get("model")):
         # 「Jev 自动」必须落到真实模型上：Jev 挂了也得换掉，不能把虚拟名字发给上游
         d = R._finish("strong", "Jev 不可用 → 自动挡兜底 strong 档", "fallback", {}, None, {}, {})
@@ -378,6 +394,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "sentinels": sorted(SENTINEL_SET) or None,
             "auto_model": AUTO_MODEL if INJECT_MODELS else None,
             "notify": NOTIFY,
+            "meter": dict(_usage) if METER else None,
+            "sticky_stats": sticky_stats() if STICKY else None,
             "set_effort": SET_EFFORT,
             "turns_decided": _state["misses"],
             "turns_reused": _state["hits"],
@@ -409,7 +427,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._health()
         is_responses = "responses" in self.path or "chat/completions" in self.path
         if is_responses and body:
-            body, _ = rewrite(body)
+            body, _ = rewrite(body, self.headers)
         return self._proxy(body)
 
     # ---- WebSocket / 其它协议升级：原样 TCP 隧道（App 的 realtime /live 走这里）
@@ -560,12 +578,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         total = 0
+        metered = METER and ("responses" in self.path or "chat/completions" in self.path)
+        tail = b""
         try:
             while True:
                 chunk = resp.read(1024)
                 if not chunk:
                     break
                 total += len(chunk)
+                if metered:
+                    # 只看流末尾：usage 出现在最后的 response.completed 事件里
+                    tail = (tail + chunk)[-METER_TAIL:]
                 self.wfile.write(("%X\r\n" % len(chunk)).encode("ascii") + chunk + b"\r\n")
                 self.wfile.flush()
             self.wfile.write(b"0\r\n\r\n")
@@ -575,10 +598,155 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             plog("relay error after %d bytes: %s" % (total, exc))
         finally:
+            if metered and tail:
+                try:
+                    record_usage(tail)
+                except Exception as exc:
+                    plog("usage 计量失败：%s" % exc)
             try:
                 conn.close()
             except Exception:
                 pass
+
+
+def parse_usage(buf):
+    """从流末尾里抠出最后一个 usage 对象（SSE 的 response.completed 事件里）。"""
+    best = None
+    for m in _USAGE_RE.finditer(buf):
+        start = m.end() - 1
+        depth = 0
+        limit = min(len(buf), start + 4000)
+        for i in range(start, limit):
+            c = buf[i:i + 1]
+            if c == b"{":
+                depth += 1
+            elif c == b"}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(buf[start:i + 1].decode("utf-8", "ignore"))
+                    except Exception:
+                        obj = None
+                    if isinstance(obj, dict) and ("input_tokens" in obj
+                                                  or "prompt_tokens" in obj):
+                        best = obj
+                    break
+    return best
+
+
+def _num(obj, *path):
+    cur = obj
+    for k in path:
+        if not isinstance(cur, dict):
+            return 0
+        cur = cur.get(k)
+    return cur if isinstance(cur, (int, float)) else 0
+
+
+def record_usage(tail):
+    """记一次上游调用的 token 消耗，写 JSONL 并累加。"""
+    u = parse_usage(tail)
+    if not u:
+        return
+    inp = int(u.get("input_tokens") or u.get("prompt_tokens") or 0)
+    out = int(u.get("output_tokens") or u.get("completion_tokens") or 0)
+    cached = int(_num(u, "input_tokens_details", "cached_tokens")
+                 or _num(u, "prompt_tokens_details", "cached_tokens"))
+    reasoning = int(_num(u, "output_tokens_details", "reasoning_tokens")
+                    or _num(u, "completion_tokens_details", "reasoning_tokens"))
+    with _lock:
+        d = _state.get("decision") or {}
+        rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+               "turn": _state.get("key"), "choice": d.get("choice"),
+               "model": d.get("model"), "input": inp, "cached": cached,
+               "output": out, "reasoning": reasoning}
+        _usage["calls"] += 1
+        for k in ("input", "cached", "output", "reasoning"):
+            _usage[k] += rec[k]
+    try:
+        with open(USAGE_LOG, "a") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    pct = (100.0 * cached / inp) if inp else 0.0
+    plog("usage in=%d cached=%d(%.0f%%) out=%d reasoning=%d model=%s"
+         % (inp, cached, pct, out, reasoning, rec["model"] or "-"))
+
+
+# ---- 粘性路由：换模型会作废上游前缀缓存（实测：换模型那一次的 cached 从 90% 掉到 0%），
+#      所以「降档」要慎重、「升档」要果断。目标是把切换次数从「每轮」降到「每个阶段」。
+STICKY = (os.environ.get("JEVPROXY_STICKY", "1") or "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+DOWN_VOTES = max(1, int(os.environ.get("JEVPROXY_DOWN_VOTES", "2")))
+_sessions = collections.OrderedDict()   # 会话 -> 当前档位 / 连续降档票数 / 切换次数
+SESS_MAX = 32
+
+
+def _session_key(headers):
+    """尽力取出会话标识，让粘性按会话独立生效。"""
+    get = getattr(headers, "get", None)
+    if not get:
+        return "default"
+    for h in ("x-codex-window-id", "x-codex-session-id"):
+        v = get(h)
+        if v:
+            return str(v).split(":")[0][:64]
+    tm = get("x-codex-turn-metadata")
+    if tm:
+        try:
+            sid = json.loads(tm).get("session_id")
+            if sid:
+                return str(sid)[:64]
+        except Exception:
+            pass
+    return "default"
+
+
+def apply_sticky(sid, decision):
+    """按「阶段」而不是「每轮」切换模型。返回 (决策, 说明)。"""
+    if not STICKY or not decision or not decision.get("model"):
+        return decision, ""
+    tier = decision.get("choice")
+    if tier not in R.ORDER:
+        return decision, ""
+    with _lock:
+        st = _sessions.get(sid)
+        if st is None:
+            st = {"tier": None, "down": 0, "switches": 0, "held": 0}
+            _sessions[sid] = st
+            while len(_sessions) > SESS_MAX:
+                _sessions.popitem(last=False)
+        else:
+            _sessions.move_to_end(sid)
+        cur = st["tier"]
+        if cur is None or tier == cur:
+            was_none = cur is None
+            st["tier"], st["down"] = tier, 0
+            return decision, "init" if was_none else "同档"
+        if R.ORDER.index(tier) > R.ORDER.index(cur):        # 升档：立即（质量优先）
+            st["tier"], st["down"], st["switches"] = tier, 0, st["switches"] + 1
+            return decision, "升档"
+        st["down"] += 1                                     # 降档：连续 N 轮都判低才降
+        if st["down"] >= DOWN_VOTES:
+            st["tier"], st["down"], st["switches"] = tier, 0, st["switches"] + 1
+            return decision, "降档"
+        st["held"] += 1
+        cur_tier, votes = cur, st["down"]
+    keep = dict(decision)
+    keep["choice"] = cur_tier
+    keep["model"] = R.TIERS[cur_tier]["model"]
+    keep["effort"] = R.TIERS[cur_tier]["effort"]
+    keep["held"] = True
+    keep["reason"] = "%s；上一轮是 %s 档 → 先保持（%d/%d 票），免得作废前缀缓存" % (
+        decision.get("reason", ""), cur_tier, votes, DOWN_VOTES)
+    return keep, "保持(降档 %d/%d)" % (votes, DOWN_VOTES)
+
+
+def sticky_stats():
+    with _lock:
+        return {"sticky": STICKY, "down_votes": DOWN_VOTES, "sessions": len(_sessions),
+                "switches": sum(s["switches"] for s in _sessions.values()),
+                "held": sum(s["held"] for s in _sessions.values())}
 
 
 class Server(http.server.ThreadingHTTPServer):

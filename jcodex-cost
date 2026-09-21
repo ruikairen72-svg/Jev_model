@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+jcodex-cost —— 把 token 账单摊开看。数据来自代理每步记录的 usage.jsonl。
+
+  jcodex-cost                 最近 7 天汇总
+  jcodex-cost --days 1        只看今天
+  jcodex-cost --json          机器可读输出
+  jcodex-cost --tail 20       逐条打印最近 20 次上游调用
+
+看什么：
+  缓存命中率 —— 决定实际单价的关键。命中部分按缓存价计（通常是全价的 1/10 左右）。
+  冷启动    —— cached=0 的调用：基本都发生在"换了模型"之后，是白扔掉的全价输入。
+  每步输入  —— 每个工具步骤都要重发全部上下文；这个数乘以步数就是账单主体。
+"""
+from __future__ import print_function
+
+import json
+import os
+import sys
+import time
+from collections import OrderedDict
+
+USAGE = os.path.expanduser(os.environ.get("JEVPROXY_USAGE_LOG",
+                                          "~/.codex/jev-router/usage.jsonl"))
+
+
+def load(days):
+    if not os.path.exists(USAGE):
+        return []
+    cutoff = time.time() - days * 86400
+    out = []
+    with open(USAGE) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            try:
+                ts = time.mktime(time.strptime(r.get("ts", ""), "%Y-%m-%dT%H:%M:%S"))
+            except Exception:
+                ts = time.time()
+            r["_ts"] = ts
+            if ts >= cutoff:
+                out.append(r)
+    return out
+
+
+def human(n):
+    if n >= 1e6:
+        return "%.2fM" % (n / 1e6)
+    if n >= 1e3:
+        return "%.1fk" % (n / 1e3)
+    return str(int(n))
+
+
+def bar(pct, width=20):
+    filled = int(round(width * pct / 100.0))
+    return "█" * filled + "·" * (width - filled)
+
+
+def main():
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        return 0
+    days = 7
+    tail = 0
+    if "--days" in args:
+        days = float(args[args.index("--days") + 1])
+    if "--tail" in args:
+        tail = int(args[args.index("--tail") + 1])
+    rows = load(days)
+    if "--json" in args:
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+        return 0
+    if not rows:
+        print("还没有计量数据（%s）。跑几次 codex 就有了。" % USAGE)
+        print("提示：代理需要 JEVPROXY_METER=1（默认开）。")
+        return 0
+
+    total = {"calls": len(rows), "input": 0, "cached": 0, "output": 0, "reasoning": 0}
+    by_model = OrderedDict()
+    by_day = OrderedDict()
+    cold = []            # cached == 0 的调用（除首次）
+    for i, r in enumerate(rows):
+        for k in ("input", "cached", "output", "reasoning"):
+            total[k] += r.get(k) or 0
+        m = r.get("model") or "(未改写)"
+        b = by_model.setdefault(m, {"calls": 0, "input": 0, "cached": 0, "output": 0})
+        b["calls"] += 1
+        for k in ("input", "cached", "output"):
+            b[k] += r.get(k) or 0
+        day = (r.get("ts") or "")[:10]
+        d = by_day.setdefault(day, {"calls": 0, "input": 0, "cached": 0, "output": 0})
+        d["calls"] += 1
+        for k in ("input", "cached", "output"):
+            d[k] += r.get(k) or 0
+        if i > 0 and (r.get("cached") or 0) == 0:
+            cold.append(r)
+
+    inp, cached = total["input"], total["cached"]
+    uncached = inp - cached
+    pct = (100.0 * cached / inp) if inp else 0.0
+
+    print("=" * 68)
+    print(" Jev 路由账单（最近 %g 天，%d 次上游调用）" % (days, total["calls"]))
+    print("=" * 68)
+    print("  输入总量        %10s tokens" % human(inp))
+    print("  其中命中缓存    %10s tokens  %5.1f%%  [%s]" % (human(cached), pct, bar(pct)))
+    print("  其中全价重算    %10s tokens" % human(uncached))
+    print("  输出            %10s tokens（其中思考 %s）"
+          % (human(total["output"]), human(total["reasoning"])))
+    print("  每步平均输入    %10s tokens" % human(inp / max(1, total["calls"])))
+
+    print("\n  按模型：")
+    for m, b in sorted(by_model.items(), key=lambda kv: -kv[1]["input"]):
+        p = (100.0 * b["cached"] / b["input"]) if b["input"] else 0.0
+        print("    %-18s %4d 次  in=%-8s cached=%5.1f%%  out=%s"
+              % (m, b["calls"], human(b["input"]), p, human(b["output"])))
+
+    print("\n  按天：")
+    for day, b in sorted(by_day.items()):
+        p = (100.0 * b["cached"] / b["input"]) if b["input"] else 0.0
+        print("    %-12s %4d 次  in=%-8s cached=%5.1f%%  out=%s"
+              % (day, b["calls"], human(b["input"]), p, human(b["output"])))
+
+    if cold:
+        waste = sum(r.get("input") or 0 for r in cold)
+        print("\n  冷启动（cached=0，多半是刚换过模型）：%d 次，合计 %s tokens 全价重算"
+              % (len(cold), human(waste)))
+        print("    这些是全价 bill 的部分。若把切换次数压下来，这部分会明显下降。")
+
+    if tail:
+        print("\n  最近 %d 次调用：" % tail)
+        for r in rows[-tail:]:
+            print("    %s  %-18s in=%-7s cached=%-7s out=%-6s %s"
+                  % (r.get("ts"), r.get("model"), human(r.get("input") or 0),
+                     human(r.get("cached") or 0), human(r.get("output") or 0),
+                     r.get("choice") or ""))
+
+    print("\n  怎么省（按影响排序）：")
+    print("    1) 上下文规模：每步都重发全部历史。琐碎任务另开会话、及时 /new，")
+    print("       不要让它把主会话撑大——上下文翻倍，每步成本就翻倍。")
+    print("    2) 别频繁换模型：换一次作废一次前缀缓存（实测 cached 从 90% → 0%）。")
+    print("       代理的粘性路由（JEVPROXY_STICKY=1）就是干这个的。")
+    print("    3) 难题用子 agent 承担，别把整段历史都喂给强模型。")
+    print("    4) 固定前缀约 1 万 tokens 起（系统提示+工具定义），每步都付；")
+    print("       关掉不用的 MCP server / 插件能直接降这个基数。")
+    print("    5) reasoning effort 匹配档位：难任务里思考 token 才是大头。")
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
