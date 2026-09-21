@@ -1,0 +1,29 @@
+# 手动接线：把下面内容并入 ~/.codex/config.toml
+#
+# 通常不用手抄——install.sh --wire（或 jcodex-doctor --fix / --on）会自动完成，
+# 并且是幂等的：缺 provider 表就补，缺 model_provider 就补，顶层 model 不是哨兵就改回来。
+
+# ── 顶层（必须放在所有 [table] 之前）──────────────────────────────────
+# 1) 让 Codex 走本地 Jev 代理
+model_provider = "jevproxy"
+
+# 2) 默认模型 = 哨兵本身。这一步很关键：
+#    App / CLI 的模型选择器会把你的选择写回这个键，如果这里是某个具体模型，
+#    代理会认为"你自己选的"而整条路由静默失效。
+model = "jev-auto"
+
+# 3) 基础 effort（代理会按档覆盖它，所以这里填什么都行）
+model_reasoning_effort = "low"
+
+
+# ── 末尾追加 provider 表 ─────────────────────────────────────────────
+[model_providers.jevproxy]
+name = "OpenAI via Jev router"
+base_url = "http://127.0.0.1:8787"
+wire_api = "responses"
+requires_openai_auth = true
+
+
+# ── 逃生通道 ────────────────────────────────────────────────────────
+# 完全绕过路由：            codex -c model_provider=openai "…"
+# 一键关闭 / 恢复路由：      jcodex-doctor --off   /   jcodex-doctor --on

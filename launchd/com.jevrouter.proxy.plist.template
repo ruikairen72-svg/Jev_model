@@ -1,0 +1,47 @@
+# LaunchAgent 模板：让本地 Jev 代理常驻（RunAtLoad + KeepAlive）。
+# 不要直接复制这个文件——install.sh --launchd 会做占位符替换并加载：
+#   __LABEL__   服务名，默认 com.jevrouter.proxy
+#   __HOME__    你的家目录
+#   __PYTHON__  python3 解释器绝对路径（须 >= 3.8，只用标准库）
+#   __PREFIX__  安装目录，默认 __HOME__/.codex/jev-router
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__PREFIX__/jev_proxy.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PREFIX__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__PREFIX__/proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PREFIX__/proxy.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- 代理启动时自己会读 ~/.codex/jev-router.env，这里只放必要的路径信息 -->
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

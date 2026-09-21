@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+jcodex —— 让 Jev 先判难度，再替你决定 Codex 用哪个模型。
+
+  jcodex "把 README 的错别字改一下"        -> Jev 判简单 -> codex -p flash
+  jcodex "重构鉴权模块并保证测试全绿"      -> Jev 判困难 -> codex -p pro
+  jcodex exec "修一下这个 bug"             -> 同样先判后跑
+  jcodex                                   -> 没有任务文本，不干预，交给你/默认配置
+
+自有参数（其余参数原样转发给 codex）：
+  --jev-dry-run         只显示决策，不真的启动 codex
+  --jev-explain         显示完整决策依据
+  --jev-model=fast|strong|keep   手动指定这一轮（keep = 不干预）
+  --jev-mock=easy|hard|image|unsure   离线演示：不调用 Jev，用假回答走策略
+  --jev-debug           打印发给 Jev 的请求/响应
+  --jev-help            显示本帮助
+
+显式指定模型/预设（-p / --profile / -m / --model / -c model=）时，jcodex 完全不动你的选择。
+Jev 不可用 / 超时 / 没 key 时 fail-open，按 JEV_FALLBACK（默认 strong）走，绝不阻塞。
+"""
+from __future__ import print_function
+
+import os
+import shutil
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import jev_router as R  # noqa: E402
+
+SUBCOMMANDS = {
+    "exec", "resume", "fork", "apply", "mcp", "login", "logout",
+    "app-server", "completion", "debug", "doctor", "features", "help", "sandbox",
+}
+
+CODEX_CANDIDATES = [
+    os.environ.get("CODEX_CLI_PATH") or "",
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    os.path.expanduser("~/.local/bin/codex"),
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+]
+
+
+def find_codex():
+    which = shutil.which("codex")
+    if which:
+        return which
+    for p in CODEX_CANDIDATES:
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def explicit_model_choice(args):
+    """用户自己指定了模型/预设？返回说明或 None。"""
+    for i, a in enumerate(args):
+        if a in ("-p", "--profile", "-m", "--model"):
+            return a
+        if a.startswith("--profile=") or a.startswith("--model="):
+            return a.split("=")[0]
+        if a.startswith("-p") and len(a) > 2:
+            return "-p"
+        if a.startswith("-m") and len(a) > 2:
+            return "-m"
+        if a in ("-c", "--config") and i + 1 < len(args) and args[i + 1].startswith("model"):
+            return "-c " + args[i + 1].split("=")[0]
+        if a.startswith("--config=") and "model" in a:
+            return "--config"
+    return None
+
+
+# 这些 flag 后面跟一个值，取任务文本时要跳过那个值，否则 "codex -p pro 改错字" 会把 pro 当任务
+VALUE_FLAGS = {
+    "-c", "--config", "-m", "--model", "-p", "--profile", "-s", "--sandbox",
+    "-C", "--cd", "--add-dir", "-i", "--image", "--ask-for-approval",
+    "--output-last-message", "--color", "--enable", "--disable", "--notify",
+}
+
+
+def task_text(args):
+    words = []
+    skip_next = False
+    for i, a in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if a in VALUE_FLAGS and "=" not in a:
+            skip_next = True
+            continue
+        if a.startswith("-"):
+            continue
+        if i == 0 and a in SUBCOMMANDS:
+            continue
+        words.append(a)
+    return " ".join(words).strip()
+
+
+def image_flag(args):
+    """codex -i shot.png / --image=shot.png → 返回该值（pro 读不了图）。"""
+    for i, a in enumerate(args):
+        if a in ("-i", "--image") and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith("--image="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def parse_own(args):
+    own = {"dry_run": False, "explain": False, "force": None, "mock": None, "debug": False}
+    rest = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--jev-help":
+            print(__doc__)
+            sys.exit(0)
+        elif a == "--jev-dry-run":
+            own["dry_run"] = True
+        elif a == "--jev-explain":
+            own["explain"] = True
+        elif a == "--jev-debug":
+            own["debug"] = True
+        elif a.startswith("--jev-model="):
+            own["force"] = a.split("=", 1)[1]
+        elif a == "--jev-model" and i + 1 < len(args):
+            i += 1
+            own["force"] = args[i]
+        elif a.startswith("--jev-mock="):
+            own["mock"] = a.split("=", 1)[1]
+        elif a == "--jev-mock" and i + 1 < len(args):
+            i += 1
+            own["mock"] = args[i]
+        else:
+            rest.append(a)
+        i += 1
+    return own, rest
+
+
+def explain_box(decision):
+    f = decision["factors"] or {}
+    a = decision["answers"] or {}
+    lines = [
+        "┌─ Jev 决策 ─────────────────────────────────────────",
+        "│ 难度分        %.2f  (0=机械改动 1=困难)" % f.get("difficulty", 0.0),
+        "│ 需要深推理    %.2f" % f.get("reasoning_need", 0.0),
+        "│ 需求模糊      %.2f" % f.get("ambiguity", 0.0),
+        "│ 含图片输入    %.2f" % f.get("image_input", 0.0),
+        "│ 预计工具轮数  %s" % f.get("tool_steps", "?"),
+        "│ 综合分        %s" % f.get("composite", "-"),
+        "│ Jev 置信度    %s" % ("-" if decision.get("confidence") is None
+                               else "%.2f" % decision["confidence"]),
+        "│ 判定          %s -> %s" % (decision["choice"], decision["model"]),
+        "│ 依据          %s" % decision["reason"],
+        "│ 来源          %s" % decision["source"],
+        "└────────────────────────────────────────────────────",
+    ]
+    if a.get("difficulty", {}).get("legend"):
+        legend = a["difficulty"]["legend"]
+        lines.insert(6, "│ 难度档位      %s" % legend.get(str(f.get("difficulty_level", 0)), "-"))
+    return "\n".join(lines)
+
+
+def main():
+    own, rest = parse_own(sys.argv[1:])
+    codex = find_codex()
+
+    forced = (own["force"] or "").lower() or None
+    if forced == "keep":
+        decision = R._finish("keep", "手动指定 keep，不干预", "manual", {}, None, {}, {})
+    elif forced in ("fast", "strong"):
+        decision = R._finish(forced, "手动指定 %s" % forced, "manual", {}, None, {}, {})
+    else:
+        choice = explicit_model_choice(rest)
+        if choice:
+            decision = R._finish("keep", "你已经显式指定了 %s，jcodex 不干预" % choice,
+                                 "manual", {}, None, {}, {})
+        else:
+            text = task_text(rest)
+            img = image_flag(rest)
+            if img:
+                decision = R._finish(
+                    "fast",
+                    "硬约束：命令行用 -i 提供了图片 %s，pro 不支持读图 → flash" % img,
+                    "hard-rule", {}, None, {}, {})
+            elif not text:
+                decision = R._finish("keep", "没有任务文本可判断（交互式启动）", "no-task",
+                                     {}, None, {}, {})
+            else:
+                decision = R.decide(text, mock=own["mock"], debug=own["debug"], hints=[text] + rest)
+
+    if own["explain"]:
+        print(explain_box(decision), file=sys.stderr)
+    elif decision["choice"] != "keep":
+        print(R.reason_line(decision), file=sys.stderr)
+
+    R._log({"task": task_text(rest)[:200], "choice": decision["choice"],
+            "model": decision["model"], "reason": decision["reason"],
+            "source": decision["source"], "factors": decision["factors"]})
+
+    prefix = []
+    if decision["choice"] != "keep":
+        if decision["profile"]:
+            prefix = ["-p", decision["profile"]]
+        elif decision["model"]:
+            prefix = ["-m", decision["model"]]
+
+    if not codex:
+        print("找不到 codex 可执行文件。设 CODEX_CLI_PATH 指向它，或把 codex 放进 PATH。", file=sys.stderr)
+        return 127
+
+    use_effort = os.environ.get("JEV_SET_EFFORT", "0") not in ("0", "false", "no")
+    if use_effort and decision["choice"] != "keep" and decision.get("effort"):
+        prefix += ["-c", "model_reasoning_effort=%s" % decision["effort"]]
+
+    cmd = [codex] + prefix + rest
+    if own["dry_run"]:
+        print("[dry-run] " + " ".join(cmd[1:]))
+        return 0
+
+    try:
+        sys.stderr.flush()
+        os.execv(codex, cmd)
+    except OSError as exc:
+        print("启动 codex 失败: %s" % exc, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

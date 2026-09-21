@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+jcodex-doctor —— 检查「codex → Jev 自动路由」整条链路，可用 --fix 自动修复。
+
+  jcodex-doctor              体检
+  jcodex-doctor --deep       体检 + 真调一次 Jev 验证 key 可用
+  jcodex-doctor --fix        自动修复：补 config.toml 接线、拉起代理、加载 launchd
+  jcodex-doctor --off        彻底关掉自动路由（config.toml 改回原生 provider）
+  jcodex-doctor --on         --off 之后重新打开
+
+检查项：
+  1. ~/.codex/jev-router.env 存在 / 权限 600 / 有 key 与四档配置
+  2. ~/.codex/config.toml：model_provider = jevproxy、provider 表完整、model = 哨兵
+  3. LaunchAgent（自动识别哪个 plist 启动了 jev_proxy.py）是否 loaded / running
+  4. 代理 /healthz 是否 200（含决策计数）
+  5. codex 二进制
+  6. 客户端模型目录里有没有「Jev 自动」那一项（App 选择器的数据源）
+"""
+from __future__ import print_function
+
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+
+HOME = os.path.expanduser("~")
+CFG = os.path.join(HOME, ".codex", "config.toml")
+ENV_FILE = os.path.join(HOME, ".codex", "jev-router.env")
+LAUNCHD_DIR = os.path.join(HOME, "Library", "LaunchAgents")
+PROXY = os.path.join(HOME, ".codex", "jev-router", "jev_proxy.py")
+PORT = os.environ.get("JEVPROXY_PORT", "8787")
+HEALTH = "http://127.0.0.1:%s/healthz" % PORT
+OFF_MARK = '# model_provider = "jevproxy"  # 已由 jcodex-doctor --off 关闭'
+
+
+def find_agent():
+    """自动找到本项目的 LaunchAgent：哪个 plist 的 ProgramArguments 里跑了 jev_proxy.py。
+
+    返回 (label, plist 路径)。可用 JEVPROXY_LAUNCHD_LABEL 显式指定 label。
+    这样换机器 / 换 label 都不用改代码。
+    """
+    override = (os.environ.get("JEVPROXY_LAUNCHD_LABEL") or "").strip()
+    try:
+        for name in sorted(os.listdir(LAUNCHD_DIR)):
+            if not name.endswith(".plist"):
+                continue
+            path = os.path.join(LAUNCHD_DIR, name)
+            try:
+                with open(path, "rb") as fh:
+                    if b"jev_proxy.py" in fh.read():
+                        return (override or name[:-6]), path
+            except Exception:
+                continue
+    except Exception:
+        pass
+    label = override or "com.jevrouter.proxy"
+    return label, os.path.join(LAUNCHD_DIR, label + ".plist")
+CODEX_CANDIDATES = [
+    os.environ.get("CODEX_CLI_PATH") or "",
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    os.path.join(HOME, ".local/bin/codex"),
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+]
+
+OK, WARN, BAD = "  ✅", "  ⚠️ ", "  ❌"
+problems = []
+fixes = []
+
+
+def say(mark, msg):
+    print("%s %s" % (mark, msg))
+
+
+def env_vals():
+    vals = {}
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE) as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    vals[k.strip()] = v.strip()
+    for k in ("JEVPROXY_PORT", "JEVPROXY_SENTINEL", "JEVPROXY_UPSTREAM"):
+        vals.setdefault(k, os.environ.get(k, ""))
+    return vals
+
+
+# ---------------------------------------------------------------- 检查
+
+def check_env(deep):
+    print("\n[1] key 与档位配置  %s" % ENV_FILE)
+    if not os.path.exists(ENV_FILE):
+        say(BAD, "文件不存在 → 建一个并写入 JEV_API_KEY=...")
+        problems.append("env")
+        return {}
+    mode = oct(os.stat(ENV_FILE).st_mode & 0o777)
+    vals = env_vals()
+    say(OK if mode == "0o600" else WARN, "权限 %s%s" % (mode, "" if mode == "0o600" else "（建议 chmod 600）"))
+    key = vals.get("JEV_API_KEY") or vals.get("TYPESAFE_API_KEY") or ""
+    say(OK if key else BAD, "API key: %s" % (("已配置（%s…%s）" % (key[:12], key[-4:])) if key else "缺失"))
+    if not key:
+        problems.append("key")
+    tiers = [k for k in ("JEV_CODEX_FAST_MODEL", "JEV_CODEX_BALANCED_MODEL",
+                         "JEV_CODEX_STRONG_MODEL", "JEV_CODEX_HEAVY_MODEL") if vals.get(k)]
+    say(OK if len(tiers) == 4 else WARN, "档位模型已配置 %d/4: %s" % (
+        len(tiers), ", ".join(vals.get(k, "-") for k in (
+            "JEV_CODEX_FAST_MODEL", "JEV_CODEX_BALANCED_MODEL",
+            "JEV_CODEX_STRONG_MODEL", "JEV_CODEX_HEAVY_MODEL"))))
+    if deep and key:
+        try:
+            sys.path.insert(0, os.path.join(HOME, ".codex", "jev-router"))
+            import jev_router as R
+            d = R.decide("给这个函数补一个单元测试")
+            say(OK if d["source"] == "jev" else WARN,
+                "真调 Jev 成功：%s 档 %s（%s）" % (d["choice"], d["model"], d["reason"][:40]))
+        except Exception as exc:
+            say(BAD, "真调 Jev 失败：%s" % str(exc)[:120])
+            problems.append("api")
+    return vals
+
+
+def check_config(vals):
+    print("\n[2] Codex 接线  %s" % CFG)
+    if not os.path.exists(CFG):
+        say(BAD, "找不到 config.toml")
+        problems.append("config")
+        return
+    text = open(CFG).read()
+    auto = (vals.get("JEVPROXY_AUTO_MODEL") or "jev-auto").strip()
+    sentinels = {s.strip().lower() for s in (vals.get("JEVPROXY_SENTINEL") or "").split(",") if s.strip()}
+    sentinels.add(auto.lower())
+    m = re.search(r'(?m)^model\s*=\s*"([^"]+)"', text)
+    cur_model = m.group(1) if m else None
+    if re.search(r'(?m)^model_provider\s*=\s*"jevproxy"', text):
+        say(OK, 'model_provider = "jevproxy"')
+    else:
+        say(BAD, "model_provider 未指向 jevproxy → codex 不会自动路由")
+        problems.append("config")
+    if "[model_providers.jevproxy]" in text:
+        say(OK, "[model_providers.jevproxy] 存在")
+    else:
+        say(BAD, "缺少 [model_providers.jevproxy] provider 表")
+        problems.append("config")
+    if cur_model and cur_model.lower() == auto.lower():
+        say(OK, 'model = "%s"（App/CLI 的选择器里就是「Jev 自动」，每轮交给 Jev）' % cur_model)
+    elif cur_model and cur_model.lower() in sentinels:
+        say(WARN, 'model = "%s" 也能触发路由，但不如 "%s" 稳：在 App 里换过模型后'
+                  '这里会变成别的值，路由就被静默绕过' % (cur_model, auto))
+        problems.append("sentinel")
+    else:
+        say(BAD, 'model = "%s" 不在哨兵集合 %s 里 → 请求会被原样放行，路由静默失效'
+                 % (cur_model, sorted(sentinels)))
+        problems.append("sentinel")
+
+
+def check_model_catalog(vals):
+    """App 的模型选择器是拿 models_cache.json 渲染的，检查「Jev 自动」有没有进去。"""
+    auto = (vals.get("JEVPROXY_AUTO_MODEL") or "jev-auto").strip()
+    path = os.path.join(HOME, ".codex", "models_cache.json")
+    print("\n[6] App 选择器里的「Jev 自动」  %s" % path)
+    if not os.path.exists(path):
+        say(WARN, "还没有模型目录缓存：跑一次 codex（或重启 App）就会生成")
+        return
+    try:
+        data = json.load(open(path))
+        items = data.get("models") if isinstance(data, dict) else data
+        slugs = [m.get("slug") for m in items if isinstance(m, dict)]
+    except Exception as exc:
+        say(WARN, "读不出来：%s" % str(exc)[:80])
+        return
+    if auto.lower() in [str(s).lower() for s in slugs]:
+        say(OK, "已包含「%s」→ App 的选择器里能直接选它（排在第一位）" % auto)
+    else:
+        say(WARN, "目录里还没有「%s」：重启一下 App，或跑一次 codex 让它刷新（--fix 会删掉缓存强制刷新）"
+                  % auto)
+        problems.append("catalog")
+
+
+def check_launchd():
+    label, plist = find_agent()
+    print("\n[3] 常驻代理（launchd %s）" % label)
+    if not os.path.exists(plist):
+        say(BAD, "缺 plist：%s（install.sh --launchd 可生成）" % plist)
+        problems.append("launchd")
+        return False
+    try:
+        p = subprocess.run(["launchctl", "print", "gui/%d/%s" % (os.getuid(), label)],
+                           capture_output=True, text=True, timeout=10)
+    except Exception as exc:
+        say(WARN, "launchctl 不可用：%s" % exc)
+        return False
+    if p.returncode != 0:
+        say(BAD, "未加载 → jcodex-doctor --fix（或 launchctl bootstrap gui/%d %s）"
+                 % (os.getuid(), plist))
+        problems.append("launchd")
+        return False
+    state = None
+    pid = None
+    for line in p.stdout.splitlines():
+        s = line.strip()
+        if s.startswith("state = "):
+            state = s.split("=", 1)[1].strip()
+            break
+    for line in p.stdout.splitlines():
+        s = line.strip()
+        if s.startswith("pid = "):
+            pid = s.split("=", 1)[1].strip()
+            break
+    say(OK if state == "running" else WARN, "launchd state=%s pid=%s" % (state, pid))
+    if state != "running":
+        problems.append("launchd")
+    return True
+
+
+def check_proxy():
+    print("\n[4] 代理健康  %s" % HEALTH)
+    try:
+        with urllib.request.urlopen(HEALTH, timeout=3) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        say(OK, "200 OK → upstream=%s 哨兵=%s" % (
+            d.get("upstream"), ",".join(d.get("sentinels") or [d.get("sentinel") or "-"])))
+        say(OK, "「Jev 自动」挡位=%s 通知=%s" % (d.get("auto_model") or "关", d.get("notify")))
+        say(OK, "累计决策 %s 次 / 复用 %s 次" % (d.get("turns_decided"), d.get("turns_reused")))
+        last = d.get("last_decision")
+        if last:
+            say(OK, "最近一次：%s %s（%s）" % (last.get("choice"), last.get("model"), last.get("reason", "")[:50]))
+        return d
+    except Exception as exc:
+        say(BAD, "连不上：%s" % str(exc)[:100])
+        problems.append("proxy")
+        return None
+
+
+def check_codex():
+    print("\n[5] codex 二进制")
+    for p in CODEX_CANDIDATES:
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
+            say(OK, p)
+            return
+    say(WARN, "PATH 和已知位置都没找到 codex（设 CODEX_CLI_PATH）")
+
+
+# ---------------------------------------------------------------- 修复
+
+def fix_config():
+    text = open(CFG).read()
+    orig = text
+    if "[model_providers.jevproxy]" not in text:
+        text = text.rstrip("\n") + """
+
+# ===== 由 jcodex-doctor 补回：Jev 自动路由 =====
+[model_providers.jevproxy]
+name = "OpenAI via Jev router"
+base_url = "http://127.0.0.1:%s"
+wire_api = "responses"
+requires_openai_auth = true
+""" % PORT
+    if not re.search(r'(?m)^model_provider\s*=\s*"jevproxy"', text):
+        # 清掉 --off 留下的注释残行，避免越攒越多
+        text = "\n".join(l for l in text.splitlines() if l.strip() != OFF_MARK) + "\n"
+        # 若已存在别的 model_provider（例如 CC Switch 写的 custom）→ **替换**而不是插入，
+        # 否则 TOML 出现重复键会直接报错
+        m = re.search(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"[^"]*"', text)
+        if m:
+            text = text[:m.start()] + 'model_provider = "jevproxy"' + text[m.end():]
+        else:
+            lines = text.splitlines()
+            for i, line in enumerate(lines):
+                if line.lstrip().startswith("["):
+                    lines.insert(i, 'model_provider = "jevproxy"')
+                    break
+            else:
+                lines.append('model_provider = "jevproxy"')
+            text = "\n".join(lines) + "\n"
+    # 顶层 model 必须是哨兵（jev-auto）。App 的选择器会把选择写回这里，
+    # 一旦变成别的具体模型，代理就会「尊重你的选择」而整条路由静默失效。
+    auto = (env_vals().get("JEVPROXY_AUTO_MODEL") or "jev-auto").strip()
+    head = text.split("\n[", 1)[0]          # 只看第一个 [table] 之前的顶层键
+    mm = re.search(r'(?m)^model\s*=\s*"[^"]*"', head)
+    if mm and mm.group(0) != 'model = "%s"' % auto:
+        text = text[:mm.start()] + 'model = "%s"' % auto + text[mm.end():]
+    if text != orig:
+        open(CFG, "w").write(text)
+        fixes.append("已补回 config.toml 的 jevproxy 接线")
+        return True
+    return False
+
+
+def fix_launchd():
+    label, plist = find_agent()
+    if not os.path.exists(plist):
+        fixes.append("plist 不存在，无法自动生成（跑 install.sh --launchd）")
+        return False
+    subprocess.call(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), label)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p = subprocess.run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), plist],
+                       capture_output=True, text=True)
+    if p.returncode == 0:
+        fixes.append("已重新加载 launchd 代理")
+        return True
+    fixes.append("launchctl bootstrap 失败（%s）；请在普通终端里执行：launchctl bootstrap gui/%d %s"
+                 % ((p.stderr or "").strip()[:60], os.getuid(), plist))
+    return False
+
+
+def start_proxy_direct():
+    log = open(os.path.join(HOME, ".codex", "jev-router", "proxy.log"), "a")
+    subprocess.Popen(["/usr/bin/python3", PROXY], stdout=log, stderr=log,
+                     start_new_session=True, cwd=os.path.dirname(PROXY))
+    fixes.append("已直接拉起代理进程（launchd 不可用时的兜底）")
+
+
+# ---------------------------------------------------------------- 开关
+
+def routing_off():
+    text = open(CFG).read()
+    if re.search(r'(?m)^model_provider\s*=\s*"jevproxy"', text):
+        open(CFG, "w").write(re.sub(r'(?m)^model_provider\s*=\s*"jevproxy".*$',
+                                    '# model_provider = "jevproxy"  # 已由 jcodex-doctor --off 关闭',
+                                    text, count=1))
+        print("已关闭自动路由（config.toml 不再指向 jevproxy；代理进程仍在跑，可以用 jcodex --on 恢复）")
+    else:
+        print("自动路由本来就是关闭的")
+
+
+def routing_on():
+    print("重新打开自动路由：")
+    changed = fix_config()
+    print("  config.toml %s" % ("已修改" if changed else "无需修改"))
+    if check_proxy() is None:
+        fix_launchd() or start_proxy_direct()
+    print("  完成")
+
+
+def main():
+    args = set(sys.argv[1:])
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        return 0
+    if "--off" in args:
+        return routing_off() or 0
+    if "--on" in args:
+        return routing_on() or 0
+
+    print("=" * 62)
+    print(" jcodex-doctor —— codex → Jev 自动路由体检")
+    print("=" * 62)
+    vals = check_env("--no-api" not in args and "--deep" in args)
+    check_config(vals)
+    check_launchd()
+    check_proxy()
+    check_codex()
+    check_model_catalog(vals)
+
+    print("\n" + "=" * 62)
+    if not problems:
+        print(" 全部正常：直接敲 codex 就会自动按难度选模型 ✅")
+        print(" App 的模型选择器里选「Jev 自动（按难度选模型）」即可（重启 App 后可见）")
+    else:
+        print(" 发现问题：%s" % ", ".join(sorted(set(problems))))
+        if "--fix" in args:
+            print("\n开始修复：")
+            if "config" in problems or "sentinel" in problems:
+                fix_config()
+            if "catalog" in problems:
+                cache = os.path.join(HOME, ".codex", "models_cache.json")
+                try:
+                    os.remove(cache)
+                    fixes.append("已删掉模型目录缓存；跑一次 codex（或重启 App）就会带「Jev 自动」重新拉取")
+                except Exception as exc:
+                    fixes.append("删缓存失败：%s" % str(exc)[:60])
+            if check_proxy() is None:
+                if not fix_launchd():
+                    start_proxy_direct()
+            for f in fixes:
+                print("  • %s" % f)
+            if fixes:
+                print("\n修复后复查：")
+                problems[:] = []
+                vals = env_vals()
+                check_config(vals)
+                check_proxy()
+                check_model_catalog(vals)
+        else:
+            print(" 加 --fix 可自动修（config.toml 接线 / launchd / 代理进程 / 模型目录）")
+    print("\n 逃生通道：codex -c model_provider=openai … 完全绕过路由")
+    print(" 退出路由：jcodex-doctor --off      重新打开：jcodex-doctor --on")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

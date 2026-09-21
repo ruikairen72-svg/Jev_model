@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+jcodex-live —— 交互式会话「每一轮都让 Jev 决定模型」的 Codex 启动器。
+
+和 jcodex 的区别：
+  jcodex       一次启动判一次（用 -p flash / -p pro）
+  jcodex-live  启动本地代理 + codex -p jevproxy，你在会话里每发一条新消息都会重新判一次
+
+用法：
+  jcodex-live "先看下这个仓库"        # 起代理并把首轮交给它决定
+  jcodex-live                        # 交互式
+  jcodex-live --jev-status           # 看代理状态和最近一次决策
+  jcodex-live --jev-stop             # 停掉后台代理
+  jcodex-live --jev-mock=hard        # 离线演示：假回答走策略
+  jcodex-live --jev-explain ...      # 会话结束后看汇总？(不需要，决策实时写进日志)
+
+不碰你的 config.toml：代理只在 ~/.codex/jevproxy.config.toml 这个独立 profile 里生效。
+"""
+from __future__ import print_function
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+PROXY = os.path.join(HERE, "jev_proxy.py")
+PROFILE = os.environ.get("JEVPROXY_PROFILE", "jevproxy")
+PORT = os.environ.get("JEVPROXY_PORT", "8787")
+HEALTH = "http://127.0.0.1:%s/healthz" % PORT
+PIDFILE = os.path.expanduser(os.environ.get("JEVPROXY_PIDFILE", "~/.codex/jev-router/proxy.pid"))
+PROXY_LOG = os.path.expanduser(os.environ.get("JEVPROXY_LOG", "~/.codex/jev-router/proxy.log"))
+
+CODEX_CANDIDATES = [
+    os.environ.get("CODEX_CLI_PATH") or "",
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    os.path.expanduser("~/.local/bin/codex"),
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+]
+
+
+def find_codex():
+    which = shutil.which("codex")
+    if which:
+        return which
+    for p in CODEX_CANDIDATES:
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def health(timeout=1.0):
+    try:
+        with urllib.request.urlopen(HEALTH, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def proxy_pid():
+    try:
+        with open(PIDFILE) as fh:
+            return int(fh.read().strip())
+    except Exception:
+        return None
+
+
+def alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def start_proxy(env_extra):
+    env = dict(os.environ)
+    env.update(env_extra)
+    log = open(PROXY_LOG, "a")
+    log.write("\n--- start %s ---\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
+    log.flush()
+    p = subprocess.Popen([sys.executable, PROXY], stdout=log, stderr=log,
+                         env=env, start_new_session=True, cwd=HERE)
+    for _ in range(40):          # 最多等 4 秒
+        time.sleep(0.1)
+        if health():
+            return p
+        if p.poll() is not None:
+            break
+    return None
+
+
+LAUNCHD_DIR = os.path.expanduser("~/Library/LaunchAgents")
+
+
+def find_agent():
+    """自动找到本项目的 LaunchAgent：哪个 plist 的 ProgramArguments 里跑了 jev_proxy.py。"""
+    override = (os.environ.get("JEVPROXY_LAUNCHD_LABEL") or "").strip()
+    try:
+        for name in sorted(os.listdir(LAUNCHD_DIR)):
+            if not name.endswith(".plist"):
+                continue
+            path = os.path.join(LAUNCHD_DIR, name)
+            try:
+                with open(path, "rb") as fh:
+                    if b"jev_proxy.py" in fh.read():
+                        return (override or name[:-6]), path
+            except Exception:
+                continue
+    except Exception:
+        pass
+    label = override or "com.jevrouter.proxy"
+    return label, os.path.join(LAUNCHD_DIR, label + ".plist")
+
+
+def launchd_state():
+    """返回 'loaded' / ''（launchctl 不可用时返回 None）"""
+    label, _ = find_agent()
+    try:
+        p = subprocess.run(["launchctl", "print", "gui/%d/%s" % (os.getuid(), label)],
+                           capture_output=True, text=True, timeout=8)
+    except Exception:
+        return None
+    return "loaded" if p.returncode == 0 else ""
+
+
+def launchd_start():
+    label, plist = find_agent()
+    p = subprocess.run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), plist],
+                       capture_output=True, text=True)
+    ok = p.returncode == 0
+    print(("已加载 launchd 常驻代理" if ok else
+           "launchctl bootstrap 失败：%s（请在普通终端执行同一条命令）" % (p.stderr or "").strip()[:80]))
+    return ok
+
+
+def stop_proxy():
+    if launchd_state() == "loaded":
+        label, _ = find_agent()
+        subprocess.call(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), label)])
+        print("已卸载 launchd 常驻代理（KeepAlive 不会再把它拉起来）。"
+              "重新开启：jcodex-live --jev-start 或 jcodex-doctor --fix")
+        try:
+            os.remove(PIDFILE)
+        except Exception:
+            pass
+        return 0
+    pid = proxy_pid()
+    if alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.3)
+        except OSError:
+            pass
+        print("已停止代理 pid=%s" % pid)
+    else:
+        subprocess.call(["pkill", "-f", "jev_proxy.py"])
+        print("已清理代理进程（如存在）")
+    try:
+        os.remove(PIDFILE)
+    except Exception:
+        pass
+    return 0
+
+
+def parse_own(args):
+    own = {"mock": None, "env": {}, "dry_run": False, "debug": False}
+    rest = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--jev-help":
+            print(__doc__)
+            sys.exit(0)
+        elif a == "--jev-status":
+            h = health()
+            st = launchd_state()
+            print("launchd: %s" % ("已加载（常驻）" if st == "loaded" else
+                                   ("未加载" if st == "" else "launchctl 不可用")))
+            print(json.dumps(h, ensure_ascii=False, indent=2) if h else "代理没在跑")
+            sys.exit(0)
+        elif a == "--jev-start":
+            sys.exit(0 if (launchd_start() and health()) else 1)
+        elif a == "--jev-stop":
+            sys.exit(stop_proxy())
+        elif a == "--jev-dry-run":
+            own["dry_run"] = True
+        elif a == "--jev-debug":
+            own["debug"] = True
+            own["env"]["JEVPROXY_DEBUG"] = "1"
+        elif a.startswith("--jev-mock="):
+            own["mock"] = a.split("=", 1)[1]
+        elif a == "--jev-mock" and i + 1 < len(args):
+            i += 1
+            own["mock"] = args[i]
+        elif a.startswith("--jev-upstream="):
+            own["env"]["JEVPROXY_UPSTREAM"] = a.split("=", 1)[1]
+        elif a.startswith("--jev-fallback="):
+            own["env"]["JEVPROXY_FALLBACK"] = a.split("=", 1)[1]
+        elif a.startswith("--jev-effort="):
+            own["env"]["JEVPROXY_SET_EFFORT"] = a.split("=", 1)[1]
+        else:
+            rest.append(a)
+        i += 1
+    if own["mock"]:
+        own["env"]["JEVPROXY_MOCK"] = own["mock"]
+    return own, rest
+
+
+def main():
+    own, rest = parse_own(sys.argv[1:])
+    codex = find_codex()
+    if not codex:
+        print("找不到 codex 可执行文件（设 CODEX_CLI_PATH 或把 codex 放进 PATH）", file=sys.stderr)
+        return 127
+
+    h = health()
+    if h:
+        # 已经在跑：如果这次要求的 mock 与运行中的不一致，就重启它
+        want = own["mock"] or None
+        if (h.get("mock") or None) != want:
+            stop_proxy()
+            h = None
+    if not h:
+        if launchd_state() == "loaded":      # 由 launchd 管着，等它起来，别再spawn一个抢端口
+            for _ in range(30):
+                time.sleep(0.1)
+                h = health()
+                if h:
+                    break
+        if not h:
+            p = start_proxy(own["env"])
+            if not p:
+                print("代理起不来，请看 %s" % PROXY_LOG, file=sys.stderr)
+                return 1
+            h = health() or {}
+
+    cmd = [codex, "-p", PROFILE] + rest
+    print("[jcodex-live] 代理已就绪 %s -> %s%s%s" % (
+        HEALTH, h.get("upstream"),
+        "  [mock=%s]" % h.get("mock") if h.get("mock") else "",
+        "  [launchd 常驻]" if launchd_state() == "loaded" else ""),
+        file=sys.stderr)
+    if own["dry_run"]:
+        print("[dry-run] " + " ".join(cmd[1:]))
+        return 0
+    sys.stderr.flush()
+    try:
+        os.execv(codex, cmd)
+    except OSError as exc:
+        print("启动 codex 失败: %s" % exc, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

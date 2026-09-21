@@ -1,0 +1,21 @@
+# 密钥与个人数据：绝不入库
+*.env
+jev-router.env
+auth.json
+*.key
+.env
+
+# 运行时产物
+*.log
+*.pid
+__pycache__/
+*.pyc
+test/seen.jsonl
+test/ws_upstream_seen.txt
+test/*.log
+capture-*.json
+models_cache.json
+
+# 本地自己的草稿
+*.local
+.DS_Store

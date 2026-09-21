@@ -1,0 +1,15 @@
+# 独立 profile：jcodex-live 用它启动 codex（-p jevproxy）
+# 放在 ~/.codex/jevproxy.config.toml
+# 好处：与主 config.toml 解耦，CC Switch 之类的工具覆写主配置也不影响这里。
+#
+# 用法：jcodex-live "任务"      或      codex -p jevproxy "任务"
+# 注意：代理没在跑时这个 profile 不可用；jcodex-live 会自动把代理拉起来。
+
+model = "gpt-6-astra"          # 占位/哨兵：代理每轮都会改写它。填真实模型名可避免 metadata 警告
+model_provider = "jevproxy"
+
+[model_providers.jevproxy]
+name = "OpenAI via Jev router"
+base_url = "http://127.0.0.1:8787"
+wire_api = "responses"
+requires_openai_auth = true
