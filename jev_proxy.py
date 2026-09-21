@@ -166,6 +166,14 @@ def auto_mock(text):
 def decide_for_turn(body):
     text, has_image, fp = newest_user_turn(body)
     if not fp:
+        # 没有 user 消息的请求（历史压缩、内部续写等）：沿用最近一次决策，
+        # 而不是另挑一个模型——一轮之内换模型会让上游前缀缓存全部失效。
+        with _lock:
+            last = _state.get("decision")
+        if last and last.get("model"):
+            if DEBUG:
+                plog("无 user 消息的内部请求 → 沿用最近决策 %s（保持整轮一致）" % last["model"])
+            return last
         return None
     with _lock:
         hit = _cache.get(fp)
@@ -174,6 +182,8 @@ def decide_for_turn(body):
             _cache.move_to_end(fp)
             _state["key"], _state["decision"] = fp, hit
             _state["hits"] += 1
+            if DEBUG:
+                plog("turn %s -> %s（复用本轮已有决策，未重新问 Jev）" % (fp, hit["model"]))
             return hit
         _state["misses"] += 1
 
